@@ -99,8 +99,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: failed to load envs: %w", err)
 	}
 
-	fmt.Println(k.String("profile"))
-
 	if ver := k.String("version"); ver != currentVersion {
 		return nil, fmt.Errorf("config: unsupported config version %q", ver)
 	}

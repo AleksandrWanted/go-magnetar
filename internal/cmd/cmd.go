@@ -15,6 +15,7 @@ import (
 	"github.com/wmentor/go-magnetar/internal/agent"
 	"github.com/wmentor/go-magnetar/internal/agent/chat"
 	"github.com/wmentor/go-magnetar/internal/config"
+	indexcmd "github.com/wmentor/go-magnetar/internal/plugins/indexcmd"
 	"github.com/wmentor/go-magnetar/internal/http/requester"
 	"github.com/wmentor/go-magnetar/internal/plugin"
 	skillplugin "github.com/wmentor/go-magnetar/internal/plugins/chatcmd/skill"
@@ -28,6 +29,7 @@ import (
 
 type Globals struct {
 	File     string `short:"f" type:"path" help:"Input file"`
+	Idxtab   string `name:"idxtab" type:"path" help:"Batch-index a JSONL file (entries with source url or path) into the RAG store and exit"`
 	Profile  string `short:"p" help:"Profile name to use"`
 	Skill    string `help:"Skill name to apply at startup"`
 	Session  string `type:"path" help:"Load conversation session from file"`
@@ -52,11 +54,25 @@ func Execute() error {
 	if err != nil {
 		return fmt.Errorf("get home dir error: %w", err)
 	}
+
+	// Project-local config wins: if <cwd>/.go-magnetar/config.yml exists,
+	// run against it (config, plugins and RAG store stay inside the project).
+	// Otherwise fall back to the home directory config.
+	workDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get work dir error: %w", err)
+	}
+
+	localConfig := filepath.Join(workDir, ".go-magnetar", "config.yml")
 	configPath := filepath.Join(homeDir, ".go-magnetar", "config.yml")
 
-	// Ensure config directory and sync templates
-	if err := template.EnsureConfigDir(homeDir); err != nil {
-		return fmt.Errorf("ensure config dir error: %w", err)
+	if _, err := os.Stat(localConfig); err == nil {
+		configPath = localConfig
+	} else {
+		// Ensure config directory and sync templates
+		if err := template.EnsureConfigDir(homeDir); err != nil {
+			return fmt.Errorf("ensure config dir error: %w", err)
+		}
 	}
 
 	cfg, err := config.Load(configPath)
@@ -73,11 +89,6 @@ func Execute() error {
 	if root.File == "" {
 		version.PrintVersion(cfg.ProfileParamString("llm.model"))
 		printEnabledModules(printer.GetDefault(), cfg)
-	}
-
-	workDir, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("get work dir error: %w", err)
 	}
 
 	skillStore := skill.NewStore(
@@ -123,6 +134,21 @@ func Execute() error {
 	}
 
 	defer plugin.Stop()
+
+	// Batch indexing mode: --idxtab <file> processes a JSONL index list into
+	// the RAG store and exits without starting the chat REPL.
+	if root.Idxtab != "" {
+		idx := indexcmd.Indexer()
+		if idx == nil {
+			return fmt.Errorf("idxtab: indexer is not available (check rag.enable and rag.llm.base_url in config)")
+		}
+		count, failed, err := indexcmd.ProcessJSONL(idx, root.Idxtab)
+		if err != nil {
+			return err
+		}
+		printer.Print(printer.IconDone, fmt.Sprintf("idxtab: %d indexed, %d failed", count, failed))
+		return nil
+	}
 
 	agent, err := chat.New(cfg, rootFS, toolStore)
 	if err != nil {

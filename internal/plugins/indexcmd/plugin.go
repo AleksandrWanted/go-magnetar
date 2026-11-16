@@ -23,6 +23,16 @@ type Plugin struct {
 	idx *indexer.Indexer
 }
 
+// activeIndexer holds the indexer created during plugin init. Batch mode
+// (go-magnetar --idxtab <file>) reuses it so both code paths share one store handle.
+var activeIndexer *indexer.Indexer
+
+// Indexer returns the plugin's indexer, or nil if the plugin did not init
+// (rag disabled or misconfigured).
+func Indexer() *indexer.Indexer {
+	return activeIndexer
+}
+
 func (p *Plugin) Init(s *plugin.State, hub plugin.Hub) error {
 	if !s.Config.Bool("rag.enable") || s.Config.String("rag.llm.base_url") == "" {
 		return nil
@@ -38,6 +48,8 @@ func (p *Plugin) Init(s *plugin.State, hub plugin.Hub) error {
 	if err != nil {
 		return fmt.Errorf("indexcmd: failed to create indexer: %w", err)
 	}
+
+	activeIndexer = p.idx
 
 	hub.RegisterChatCommand(plugin.ChatCommand{
 		Name:    "index",
@@ -144,20 +156,38 @@ type Entry struct {
 	Message string `json:"message"`
 }
 
-func (p *Plugin) executeTab(ctx context.Context, params *plugin.ChatCommandInput) (*plugin.ChatCommandResponse, error) {
-	args := params.Args
-	filename := common.ExpandHome(strings.TrimSpace(args))
+// indexEntry indexes a single JSONL entry: URL via fetch, otherwise file path
+// (relative paths are resolved against baseDir).
+func indexEntry(idx *indexer.Indexer, entry Entry, baseDir string) error {
+	source := entry.Source
+
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		return idx.IndexURL(source, entry.Message)
+	}
+
+	if !filepath.IsAbs(source) {
+		source = filepath.Join(baseDir, source)
+	}
+	return idx.IndexFile(source, entry.Message)
+}
+
+// ProcessJSONL batch-indexes a JSONL file into the RAG store. Lines may be
+// empty or start with '#'. Returns the number of successfully indexed entries
+// and the number of errors.
+func ProcessJSONL(idx *indexer.Indexer, filename string) (int, int, error) {
+	filename = common.ExpandHome(filename)
 
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, fmt.Errorf("open file error: %w", err)
+		return 0, 0, fmt.Errorf("open file error: %w", err)
 	}
 	defer file.Close()
 
-	workDir := filepath.Dir(filename)
+	// Relative sources inside the JSONL resolve against the JSONL's directory.
+	baseDir := filepath.Dir(filename)
 
 	scanner := bufio.NewScanner(file)
-	count := 0
+	count, failed := 0, 0
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -168,33 +198,36 @@ func (p *Plugin) executeTab(ctx context.Context, params *plugin.ChatCommandInput
 		var entry Entry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			printer.Error("json parse error", "line", line, "error", err)
+			failed++
 			continue
 		}
 
-		source := entry.Source
-		message := entry.Message
-
-		if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-			if err := p.idx.IndexURL(source, message); err != nil {
-				printer.Error("index URL failed", "url", source, "error", err)
-				continue
-			}
-		} else {
-			if !filepath.IsAbs(source) {
-				source = filepath.Join(workDir, source)
-			}
-			if err := p.idx.IndexFile(source, message); err != nil {
-				printer.Error("index file failed", "file", source, "error", err)
-				continue
-			}
+		if err := indexEntry(idx, entry, baseDir); err != nil {
+			printer.Error("index entry failed", "source", entry.Source, "error", err)
+			failed++
+			continue
 		}
 
 		count++
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan error: %w", err)
+		return count, failed, fmt.Errorf("scan error: %w", err)
 	}
+
+	return count, failed, nil
+}
+
+func (p *Plugin) executeTab(ctx context.Context, params *plugin.ChatCommandInput) (*plugin.ChatCommandResponse, error) {
+	args := params.Args
+	filename := strings.TrimSpace(args)
+
+	count, failed, err := ProcessJSONL(p.idx, filename)
+	if err != nil {
+		return nil, err
+	}
+
+	printer.Print(printer.IconDone, fmt.Sprintf("idxtab: done, %d indexed, %d failed", count, failed))
 
 	return plugin.NopChatCommandResponse, nil
 }
